@@ -1,11 +1,9 @@
 ﻿"""
 worker.py — бот для чата «Окно в Европу».
 
-Команды начинаются с точки. Сообщения без точки — игнорируются.
-
-Исходящие (is_out=True) сообщения НЕ игнорируются полностью —
-колбэк получает их индекс и возвращает его, чтобы last_seen_index
-двигался вперёд и бот не реагировал на свои ответы как на команды.
+Команды начинаются с точки. После точки допускается случайный пробел — он trimмится.
+Сообщения без точки (вне режима сёрфинга) игнорируются.
+Исходящие сообщения бота фильтруются через BotSession._sent.
 """
 
 import asyncio
@@ -29,27 +27,19 @@ CHAT_NAME = "Окно в Европу"
 # ─────────────────────────────────────────────────────────────────────────────
 
 WHITELISTS = [
-    {
-        "name": "vless_lite.txt",
-        "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt",
-    },
-    {
-        "name": "whitelist_nowmeow.txt",
-        "url": "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist",
-    },
-    {
-        "name": "Vless-Reality-White-Lists-Rus-Mobile.txt",
-        "url": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    },
+    {"name": "vless_lite.txt",
+     "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt"},
+    {"name": "whitelist_nowmeow.txt",
+     "url": "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist"},
+    {"name": "Vless-Reality-White-Lists-Rus-Mobile.txt",
+     "url": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt"},
 ]
 
 MEME_SUBREDDITS_EN = ["memes", "dankmemes", "wholesomememes", "AdviceAnimals"]
 PIKABU_HOT_URL     = "https://pikabu.ru/rss/section/all"
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-
-BROWSER_VIEWPORT = {"width": 1280, "height": 720}
-CLICK_MAX_DEPTH  = 5
+IMAGE_EXTS         = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+BROWSER_VIEWPORT   = {"width": 1280, "height": 720}
+CLICK_MAX_DEPTH    = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Состояние сёрфинга
@@ -66,6 +56,30 @@ class SurfState:
         self.click_rect: tuple[int,int,int,int] | None = None
 
 _surf = SurfState()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Утилиты парсинга команд
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_cmd(raw: str) -> str | None:
+    """
+    Извлекает команду из текста сообщения.
+    Формат: .<cmd> [args]  — пробел после точки допустим (trimмится).
+    Возвращает "cmd args" в нижнем регистре или None если не команда.
+    """
+    s = raw.strip()
+    if not s.startswith("."):
+        return None
+    return s[1:].strip().lower()
+
+
+def _parse_arg(raw: str, prefix: str) -> str:
+    """
+    Возвращает аргумент команды с сохранением оригинального регистра.
+    Например: '.dl https://Example.com', prefix='dl' -> 'https://Example.com'
+    """
+    body = raw.strip()[1:].strip()          # убираем точку + пробел после неё
+    return body[len(prefix):].strip()       # убираем имя команды + пробел
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Новости BBC
@@ -166,7 +180,7 @@ async def fetch_random_meme(lang: str = "ru") -> tuple[str | None, str | None]:
 # Браузер — запуск / остановка
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def browser_start(session: ChatSession) -> None:
+async def browser_start(session: "BotSession") -> None:
     if _surf.browser and _surf.browser.is_connected():
         await session.send("⚠️ Браузер уже запущен.")
         return
@@ -183,12 +197,12 @@ async def browser_start(session: ChatSession) -> None:
             ),
         )
         _surf.page = await _surf.context.new_page()
-        await session.send("✅ Браузер запущен. Войди в режим сёрфинга: .Браузер")
+        await session.send("✅ Браузер запущен. Войди в режим сёрфинга: .serf")
     except Exception as e:
         await session.send(f"❌ Не удалось запустить браузер: {e}")
 
 
-async def browser_stop(session: ChatSession) -> None:
+async def browser_stop(session: "BotSession") -> None:
     _surf.active      = False
     _surf.click_rect  = None
     _surf.click_depth = 0
@@ -218,7 +232,9 @@ async def _take_screenshot() -> Path | None:
     return tmp
 
 
-async def _send_screenshot(session: ChatSession, caption: str | None = None) -> None:
+async def _send_screenshot(session: "BotSession", caption: str | None = None) -> None:
+    if caption and len(caption) > 50:
+        caption = caption[:47] + "..."
     tmp = await _take_screenshot()
     if not (tmp and tmp.exists()):
         await session.send("❌ Не удалось сделать скриншот.")
@@ -243,33 +259,31 @@ def _draw_grid(image_path: Path, rect: tuple[int,int,int,int]) -> Path:
     rx, ry, rw, rh = rect
     cw, ch = rw // 3, rh // 3
     try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28
-        )
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
     for row in range(3):
         for col in range(3):
             num = row * 3 + col + 1
             x0, y0 = rx + col * cw, ry + row * ch
-            x1, y1 = x0 + cw,       y0 + ch
+            x1, y1 = x0 + cw, y0 + ch
             draw.rectangle([x0, y0, x1, y1], outline="red", width=3)
             tx, ty = x0 + cw // 2 - 10, y0 + ch // 2 - 15
             draw.text((tx + 2, ty + 2), str(num), fill="black", font=font)
-            draw.text((tx,     ty),     str(num), fill="white", font=font)
+            draw.text((tx, ty),         str(num), fill="white", font=font)
     out = Path(tempfile.gettempdir()) / "surf_grid.png"
     img.save(out)
     return out
 
 
-async def _send_grid(session: ChatSession) -> None:
+async def _send_grid(session: "BotSession") -> None:
     tmp_screen = await _take_screenshot()
     if not tmp_screen:
         await session.send("❌ Не удалось сделать скриншот.")
         return
     grid_img = _draw_grid(tmp_screen, _surf.click_rect)
     caption  = (
-        f"Выбери зону (1–9) или .Стоп для отмены "
+        f"Выбери зону (1–9) или .cancel для отмены "
         f"(шаг {_surf.click_depth + 1}/{CLICK_MAX_DEPTH})"
     )
     try:
@@ -294,22 +308,27 @@ def _cell_rect(parent: tuple[int,int,int,int], cell: int) -> tuple[int,int,int,i
 # Обработчик команд сёрфинга
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def handle_surf_command(text: str, session: ChatSession) -> None:
-    raw = text.strip()
+async def handle_surf_command(raw_text: str, session: "BotSession") -> None:
+    raw = raw_text.strip()
 
     # ── Режим уточнения клика ─────────────────────────────────────────────
     if _surf.click_rect is not None:
-        if raw.lower() in (".стоп", ".stop", ".отмена", ".cancel"):
+        if _parse_cmd(raw) == "cancel":
             _surf.click_rect  = None
             _surf.click_depth = 0
             await session.send("❌ Клик отменён.")
             return
-        if re.fullmatch(r"[1-9]", raw):
-            cell     = int(raw)
-            new_rect = _cell_rect(_surf.click_rect, cell)
-            _surf.click_depth += 1
+        if re.fullmatch(r"[1-9]+", raw):
+            # Можно ввести сразу несколько цифр: "45" = сначала 4, потом 5
+            for ch in raw:
+                cell     = int(ch)
+                new_rect = _cell_rect(_surf.click_rect, cell)
+                _surf.click_depth += 1
+                _surf.click_rect   = new_rect
+                if _surf.click_depth >= CLICK_MAX_DEPTH:
+                    break
             if _surf.click_depth >= CLICK_MAX_DEPTH:
-                rx, ry, rw, rh = new_rect
+                rx, ry, rw, rh = _surf.click_rect
                 cx, cy = rx + rw // 2, ry + rh // 2
                 _surf.click_rect  = None
                 _surf.click_depth = 0
@@ -321,35 +340,32 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
                     pass
                 await _send_screenshot(session, _surf.page.url)
             else:
-                _surf.click_rect = new_rect
                 await _send_grid(session)
             return
-        await session.send("Введи цифру от 1 до 9 или .Стоп для отмены.")
+        await session.send("Введи цифры (1–9) или .cancel для отмены.")
         return
 
     # ── Обычные команды сёрфинга ──────────────────────────────────────────
-    if not raw.startswith("."):
+    cmd = _parse_cmd(raw)
+    if cmd is None:
         return
 
-    cmd_full  = raw[1:].strip()
-    cmd_lower = cmd_full.lower()
-
-    if cmd_lower in ("выход", "exit", "quit"):
+    if cmd == "exit":
         _surf.active = False
         await session.send(
             "🚪 Вышел из режима сёрфинга. Браузер работает в фоне.\n"
-            "Войти снова: .Браузер | Остановить: .СтопБраузер"
+            "Войти снова: .serf | Остановить: .stopserf"
         )
         return
 
-    if cmd_lower in ("стоп", "stop"):
+    if cmd == "cancel":
         _surf.active = False
         await session.send("🚪 Режим сёрфинга приостановлен.")
         return
 
-    url_m = re.match(r"^(url|открыть|go|перейти)\s+(\S+)$", cmd_lower)
-    if url_m:
-        url = cmd_full.split(None, 1)[1].strip()
+    go_m = re.match(r"^go\s+(\S+)$", cmd)
+    if go_m:
+        url = go_m.group(1)
         if not url.startswith("http"):
             url = "https://" + url
         await session.send(f"🌐 Открываю {url}...")
@@ -363,7 +379,7 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("обновить", "reload", "refresh"):
+    if cmd == "reload":
         try:
             await _surf.page.reload(wait_until="networkidle", timeout=15_000)
         except Exception:
@@ -371,38 +387,55 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("скрин", "screen", "screenshot"):
+    if cmd == "screen":
         await _send_screenshot(session, _surf.page.url)
         return
 
-    scroll_m = re.match(r"^(вниз|down|вверх|up)(?:\s+(\d+))?$", cmd_lower)
+    scroll_m = re.match(r"^(down|up)(?:\s+(\d+))?$", cmd)
     if scroll_m:
         direction = scroll_m.group(1)
         px = int(scroll_m.group(2)) if scroll_m.group(2) else 600
-        dy = px if direction in ("вниз", "down") else -px
+        dy = px if direction == "down" else -px
         await _surf.page.evaluate(f"window.scrollBy(0, {dy})")
         await asyncio.sleep(0.4)
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("клик", "click"):
-        _surf.click_rect  = (0, 0, BROWSER_VIEWPORT["width"], BROWSER_VIEWPORT["height"])
-        _surf.click_depth = 0
-        await _send_grid(session)
+    click_m = re.match(r"^click(?:\s*([1-9]+))?$", cmd)
+    if click_m:
+        digits = click_m.group(1) or ""
+        rect   = (0, 0, BROWSER_VIEWPORT["width"], BROWSER_VIEWPORT["height"])
+        depth  = 0
+        for ch in digits:
+            if depth >= CLICK_MAX_DEPTH:
+                break
+            rect  = _cell_rect(rect, int(ch))
+            depth += 1
+        if depth >= CLICK_MAX_DEPTH:
+            rx, ry, rw, rh = rect
+            cx, cy = rx + rw // 2, ry + rh // 2
+            await session.send(f"🖱️ Кликаю в ({cx}, {cy})...")
+            await _surf.page.mouse.click(cx, cy)
+            try:
+                await _surf.page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+            await _send_screenshot(session, _surf.page.url)
+        else:
+            _surf.click_rect  = rect
+            _surf.click_depth = depth
+            await _send_grid(session)
         return
 
-    # .Ввод <текст> — напечатать текст в активный элемент (поле поиска и т.п.)
-    input_m = re.match(r"^(ввод|type|input|напиши)\s+(.+)$", cmd_lower)
-    if input_m:
-        # Берём оригинальный текст с сохранением регистра
-        typed = cmd_full.split(None, 1)[1]
+    type_m = re.match(r"^type\s+", cmd)
+    if type_m:
+        typed = _parse_arg(raw, "type")
         await _surf.page.keyboard.type(typed, delay=30)
         await asyncio.sleep(0.3)
         await _send_screenshot(session, _surf.page.url)
         return
 
-    # .Энтер — нажать Enter в активном элементе
-    if cmd_lower in ("энтер", "enter"):
+    if cmd == "enter":
         await _surf.page.keyboard.press("Enter")
         try:
             await _surf.page.wait_for_load_state("networkidle", timeout=10_000)
@@ -411,7 +444,7 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("назад", "back"):
+    if cmd == "back":
         try:
             await _surf.page.go_back(wait_until="networkidle", timeout=10_000)
         except Exception:
@@ -419,7 +452,7 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("вперёд", "вперед", "forward"):
+    if cmd == "fwd":
         try:
             await _surf.page.go_forward(wait_until="networkidle", timeout=10_000)
         except Exception:
@@ -427,11 +460,11 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
         await _send_screenshot(session, _surf.page.url)
         return
 
-    if cmd_lower in ("помощь", "help"):
+    if cmd == "help":
         await session.send(SURF_HELP_TEXT)
         return
 
-    await session.send(f"❓ Неизвестная команда: .{cmd_full}\nВведи .Помощь")
+    await session.send(f"❓ Неизвестная команда: {raw}\nВведи .help")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Тексты
@@ -440,35 +473,35 @@ async def handle_surf_command(text: str, session: ChatSession) -> None:
 SURF_HELP_TEXT = """\
 🌐 Команды режима сёрфинга:
 
-.URL <адрес>    — открыть страницу (можно без https://)
-.Обновить       — перезагрузить страницу
-.Скрин          — скриншот без действий
-.Вниз [px]      — прокрутить вниз (по умолч. 600px)
-.Вверх [px]     — прокрутить вверх
-.Клик           — выбрать место клика (сетка 3×3)
-.Ввод <текст>   — напечатать текст в активный элемент
-.Энтер          — нажать Enter
-.Назад          — страница назад
-.Вперёд         — страница вперёд
-.Выход          — выйти из режима (браузер остаётся)\
+.go <url>       — открыть страницу (можно без https://)
+.reload         — перезагрузить страницу
+.screen         — скриншот без действий
+.down [px]      — прокрутить вниз (по умолч. 600px)
+.up [px]        — прокрутить вверх
+.click          — выбрать место клика (сетка 3×3, макс. 3 шага)
+.type <текст>   — напечатать текст в активный элемент
+.enter          — нажать Enter
+.back           — страница назад
+.fwd            — страница вперёд
+.exit           — выйти из режима (браузер остаётся)\
 """
 
 HELP_TEXT = """\
 📋 Список команд:
 
-.Старт / .Start      — приветствие
-.Помощь / .Help      — этот список
+.start          — приветствие
+.help           — этот список
 
-.Скачать <URL>       — скачать файл по ссылке
-.Белые               — белые списки для VPN (РФ)
-.Новости             — последние новости BBC
-.Мем [ru|en]         — случайный мем (по умолч. ru)
+.dl <URL>       — скачать файл по ссылке
+.wl             — белые списки для VPN (РФ)
+.news           — последние новости BBC
+.meme [ru|en]   — случайный мем (по умолч. ru)
 
-.ЗапускБраузер       — запустить браузер для сёрфинга
-.Браузер             — войти в режим сёрфинга
-.СтопБраузер         — остановить браузер
+.startserf      — запустить браузер для сёрфинга
+.serf           — войти в режим сёрфинга
+.stopserf       — остановить браузер
 
-Все команды нечувствительны к регистру.\
+Пробел после точки допустим: «. help» = «.help»\
 """
 
 START_TEXT = """\
@@ -476,55 +509,51 @@ START_TEXT = """\
 
 У меня есть полный доступ в интернет, поэтому я могу:
 
-📥 Скачивать файлы по ссылке     → .Скачать <URL>
-📄 Отдавать белые списки для VPN  → .Белые
-📰 Показывать новости BBC         → .Новости
-😂 Случайный мем (ru/en)          → .Мем / .Мем en
-🌐 Серфить интернет               → .ЗапускБраузер → .Браузер
+📥 Скачивать файлы по ссылке     → .dl <URL>
+📄 Отдавать белые списки для VPN  → .wl
+📰 Показывать новости BBC         → .news
+😂 Случайный мем (ru/en)          → .meme / .meme en
+🌐 Серфить интернет               → .startserf → .serf
 
-Введи .Помощь чтобы увидеть все команды.\
+Введи .help чтобы увидеть все команды.\
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Главный обработчик
+# Главный обработчик команд
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def handle_command(text: str, session: ChatSession) -> None:
-    raw = text.strip()
-
+async def handle_command(text: str, session: "BotSession") -> None:
     if _surf.active:
-        await handle_surf_command(raw, session)
+        await handle_surf_command(text, session)
         return
 
-    if not raw.startswith("."):
+    cmd = _parse_cmd(text)
+    if cmd is None:
         return
 
-    cmd_full  = raw[1:].strip()
-    cmd_lower = cmd_full.lower()
-
-    if cmd_lower in ("старт", "start"):
+    if cmd == "start":
         await session.send(START_TEXT)
         return
 
-    if cmd_lower in ("помощь", "help"):
+    if cmd == "help":
         await session.send(HELP_TEXT)
         return
 
-    if cmd_lower in ("белые", "whitelist", "wl"):
+    if cmd == "wl":
         await session.send("⬇️ Скачиваю белые списки...")
         for wl in WHITELISTS:
             await _download_and_send(wl["url"], wl["name"], session)
         return
 
-    if cmd_lower in ("новости", "news"):
+    if cmd == "news":
         await session.send("⏳ Загружаю новости BBC...")
         news = await fetch_bbc_news()
         await session.send(news)
         return
 
-    meme_m = re.fullmatch(r"(мем|мeme|meme|mem)(?:\s+(ru|en))?", cmd_lower)
+    meme_m = re.fullmatch(r"meme(?:\s+(ru|en))?", cmd)
     if meme_m:
-        lang = (meme_m.group(2) or "ru").lower()
+        lang = (meme_m.group(1) or "ru").lower()
         await session.send(f"🎲 Ищу {'русский' if lang == 'ru' else 'английский'} мем...")
         image_url, title = await fetch_random_meme(lang)
         if image_url:
@@ -545,13 +574,13 @@ async def handle_command(text: str, session: ChatSession) -> None:
             await session.send(title or "❌ Не удалось получить мем.")
         return
 
-    if cmd_lower in ("запускбраузер", "startbrowser", "браузерзапуск"):
+    if cmd == "startserf":
         await browser_start(session)
         return
 
-    if cmd_lower in ("браузер", "browser", "сёрфинг", "серфинг", "surf"):
+    if cmd == "serf":
         if not (_surf.browser and _surf.browser.is_connected()):
-            await session.send("⚠️ Браузер не запущен. Сначала: .ЗапускБраузер")
+            await session.send("⚠️ Браузер не запущен. Сначала: .startserf")
             return
         _surf.active = True
         current_url  = _surf.page.url if _surf.page else "about:blank"
@@ -563,21 +592,21 @@ async def handle_command(text: str, session: ChatSession) -> None:
         asyncio.create_task(_send_screenshot(session, current_url))
         return
 
-    if cmd_lower in ("стопбраузер", "stopbrowser", "браузерстоп"):
+    if cmd == "stopserf":
         await browser_stop(session)
         return
 
-    dl_m = re.match(r"^(скачать|download|dl)\s+\S+$", cmd_lower)
+    dl_m = re.match(r"^dl\s+\S+$", cmd)
     if dl_m:
-        url      = cmd_full.split(None, 1)[1].strip()
+        url      = _parse_arg(text, "dl")
         filename = _filename_from_url(url)
         await session.send(f"⬇️ Скачиваю: {url}")
         await _download_and_send(url, filename, session)
         return
 
     await session.send(
-        f"❓ Неизвестная команда: .{cmd_full}\n"
-        f"Введи .Помощь чтобы увидеть список команд."
+        f"❓ Неизвестная команда: {text.strip()}\n"
+        f"Введи .help чтобы увидеть список команд."
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -603,7 +632,7 @@ async def _download_to_tmp(url: str) -> Path | None:
         return None
 
 
-async def _download_and_send(url: str, filename: str, session: ChatSession) -> None:
+async def _download_and_send(url: str, filename: str, session: "BotSession") -> None:
     tmp_path = Path(tempfile.gettempdir()) / filename
     try:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
@@ -621,14 +650,13 @@ async def _download_and_send(url: str, filename: str, session: ChatSession) -> N
                 pass
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BotSession — обёртка над ChatSession с трекингом отправленных текстов
+# BotSession — обёртка над ChatSession с фильтрацией собственных сообщений
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BotSession:
     """
-    Оборачивает ChatSession и запоминает все тексты/подписи которые
-    бот сам отправил. Колбэк использует этот список чтобы не реагировать
-    на собственные сообщения бота (они тоже приходят как is_out=True).
+    Оборачивает ChatSession и запоминает тексты которые бот сам отправил,
+    чтобы не реагировать на них как на входящие команды.
     """
 
     _CACHE_LIMIT = 200
@@ -644,27 +672,25 @@ class BotSession:
             self._sent.pop(0)
 
     def is_bot_message(self, text: str) -> bool:
-        key = text.strip()[:60]
-        return key in self._sent
+        return text.strip()[:60] in self._sent
 
-    async def send(self, text: str) -> int | None:
+    async def send(self, text: str) -> None:
         self._remember(text)
-        return await self._s.send(text)
+        await self._s.send(text)
 
-    async def send_image(self, image_path, caption: str | None = None) -> int | None:
+    async def send_image(self, image_path, caption: str | None = None) -> None:
         if caption:
             self._remember(caption)
-        return await self._s.send_image(image_path, caption)
+        await self._s.send_image(image_path, caption)
 
-    async def send_file(self, file_path) -> int | None:
-        return await self._s.send_file(file_path)
+    async def send_file(self, file_path) -> None:
+        await self._s.send_file(file_path)
 
     def listen(self, callback, poll_interval: float = 1.5):
         return self._s.listen(callback, poll_interval)
 
     def stop_listening(self) -> None:
-        return self._s.stop_listening()
-
+        self._s.stop_listening()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Точка входа
@@ -678,16 +704,13 @@ async def run_worker(page: Page):
         return
 
     session = BotSession(raw_session)
-    await session.send("✅ Бот запущен! Введи .Помощь чтобы увидеть команды.")
+    await session.send("✅ Бот запущен! Введи .help чтобы увидеть команды.")
 
-    def make_callback(s: BotSession):
-        async def on_message(text: str, is_out: bool) -> int | None:
-            if s.is_bot_message(text):
-                return None
-            asyncio.create_task(handle_command(text, s))
-            return None
-        return on_message
+    async def on_message(text: str, is_out: bool) -> None:
+        if session.is_bot_message(text):
+            return
+        asyncio.create_task(handle_command(text, session))
 
-    task = session.listen(make_callback(session))
+    task = session.listen(on_message)
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.Future()
