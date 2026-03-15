@@ -43,6 +43,8 @@ async def run_worker(page: Page):
         return
 
     await session_a.send("Сервис запущен!")
+    await session_a.send_file(r"D:\VisualStudio\MaxSelfBot\MaxSelfBot\chat_actions.py")
+    await session_a.send_image(r"D:\semen\ava7.png", "test")
 
     switch_done = asyncio.Event()
     task_a = session_a.listen(make_switching_callback(session_a, switch_done))
