@@ -32,15 +32,24 @@ _JS_GET_MESSAGES = """
         const isOut = wrapper.className.includes('messageWrapper--isOut');
         const bubble = wrapper.querySelector('.bubble');
         if (!bubble) continue;
-        const textSpan = bubble.querySelector('span.text');
-        const text = textSpan ? textSpan.innerText.trim() : null;
+
+        // Ищем span.text который НЕ находится внутри .header (там имя отправителя).
+        let text = null;
+        const spans = bubble.querySelectorAll('span.text');
+        for (const span of spans) {
+            if (!span.closest('.header')) {
+                text = span.innerText.trim();
+                break;
+            }
+        }
+
         result.push({ index, isOut, text });
     }
     return result;
 }
 """
 
-MessageCallback = Callable[[str], Awaitable[int | None]]
+MessageCallback = Callable[[str, bool], Awaitable[int | None]]
 
 
 # ─────────────────────────────────────────────
@@ -209,7 +218,7 @@ class ChatSession:
                     print(f"[{self._chat_name}] {kind} [idx={idx}]: {text!r}")
 
                     try:
-                        result = await callback(text)
+                        result = await callback(text, is_out)
                         if isinstance(result, int) and result > last_seen_index:
                             last_seen_index = result
                     except Exception as e:
