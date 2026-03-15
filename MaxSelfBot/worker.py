@@ -36,7 +36,6 @@ WHITELISTS = [
 ]
 
 MEME_SUBREDDITS_EN = ["memes", "dankmemes", "wholesomememes", "AdviceAnimals"]
-PIKABU_HOT_URL     = "https://pikabu.ru/rss/section/all"
 IMAGE_EXTS         = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 BROWSER_VIEWPORT   = {"width": 1280, "height": 720}
 CLICK_MAX_DEPTH    = 3
@@ -114,7 +113,16 @@ def _is_image_url(url: str) -> bool:
 
 
 async def _fetch_meme_en() -> tuple[str | None, str | None]:
-    headers   = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
+    """
+    Получает случайный английский мем.
+    Источники (в порядке fallback):
+      1. meme-api.com  — публичный, без ключей
+      2. Imgur gallery RSS — публичный, без ключей
+    Reddit заблокировал прямые запросы без OAuth, поэтому не используется.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
+
+    # ── 1. meme-api.com ───────────────────────────────────────────────────
     subreddit = random.choice(MEME_SUBREDDITS_EN)
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=headers) as client:
@@ -127,45 +135,64 @@ async def _fetch_meme_en() -> tuple[str | None, str | None]:
                     return url, data.get("title", "")
     except Exception:
         pass
+
+    # ── 2. Imgur viral gallery RSS ────────────────────────────────────────
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(f"https://www.reddit.com/r/{subreddit}/hot.json?limit=50")
-            resp.raise_for_status()
-        posts = resp.json()["data"]["children"]
-        random.shuffle(posts)
-        for post in posts:
-            d = post["data"]
-            if d.get("over_18") or d.get("spoiler") or d.get("is_self"):
-                continue
-            url = d.get("url", "")
-            if _is_image_url(url):
-                return url, d.get("title", "")
-    except Exception as e:
-        return None, f"❌ Не удалось получить мем: {e}"
-    return None, "❌ Не нашёл мем, попробуй ещё раз."
+            resp = await client.get("https://imgur.com/r/memes/top/week.rss")
+        if resp.status_code == 200:
+            items = re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)
+            candidates = []
+            for item in items:
+                # Imgur RSS содержит <enclosure> с прямой ссылкой на картинку
+                enc = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
+                if enc and _is_image_url(enc.group(1)):
+                    title_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", item, re.DOTALL)
+                    title = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
+                    candidates.append((enc.group(1), title))
+            if candidates:
+                return random.choice(candidates)
+    except Exception:
+        pass
+
+    return None, "❌ Не удалось найти английский мем. Попробуй позже."
 
 
 async def _fetch_meme_ru() -> tuple[str | None, str | None]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
+    """
+    Парсит страницу горячего Пикабу и возвращает случайную картинку.
+    RSS Пикабу сломан (enclosure пустой), поэтому используем HTML.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+    }
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
-            resp = await client.get(PIKABU_HOT_URL)
+            resp = await client.get("https://pikabu.ru/hot")
             resp.raise_for_status()
-        items = re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)
+
+        # Ищем story-блоки с картинками
+        # Пикабу хранит картинки в <img data-src="..."> внутри .story__image
+        image_blocks = re.findall(
+            r'<article[^>]+data-story-id[^>]*>(.*?)</article>',
+            resp.text, re.DOTALL
+        )
         candidates = []
-        for item in items:
-            enc = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
-            if not enc:
-                continue
-            url = enc.group(1)
-            if not _is_image_url(url):
-                continue
-            title_m = re.search(
-                r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>",
-                item, re.DOTALL,
-            )
-            title = (title_m.group(1) or title_m.group(2) or "").strip() if title_m else ""
-            candidates.append((url, title))
+        for block in image_blocks:
+            # Заголовок поста
+            title_m = re.search(r'<h2[^>]+class="[^"]*story__title[^"]*"[^>]*>.*?<a[^>]*>(.*?)</a>', block, re.DOTALL)
+            title = re.sub(r'<[^>]+>', "", title_m.group(1)).strip() if title_m else ""
+
+            # Ищем прямые ссылки на картинки (data-src или src)
+            imgs = re.findall(r'(?:data-src|src)="(https://[^"]+pikabu\.ru[^"]+\.(?:jpg|jpeg|png|gif)(?:\?[^"]*)?)"', block)
+            # Также ищем в data-large (полный размер)
+            imgs += re.findall(r'data-large="(https://[^"]+\.(?:jpg|jpeg|png|gif)(?:\?[^"]*)?)"', block)
+            # Фильтруем аватарки (обычно маленькие, содержат /avatars/ или очень короткие)
+            imgs = [u for u in imgs if "/avatars/" not in u and "/images/" not in u]
+            for img_url in imgs:
+                candidates.append((img_url, title))
+
         if candidates:
             return random.choice(candidates)
     except Exception as e:
