@@ -1,10 +1,14 @@
-﻿"""
+"""
 chat_actions.py — библиотека для работы с Telegram Web через Playwright.
 
 Основные сущности:
   ChatSession    — контекст открытого чата (отправка, подписка на новые сообщения)
   open_chat()    — открыть чат по имени, вернуть ChatSession
   send_to_chat() — разовая отправка без подписки
+
+Новые функции:
+  get_chats_with_unread() — список чатов с непрочитанными сообщениями
+  get_current_chat_id()   — числовой id текущего открытого чата (из URL)
 
 Пример использования:
 
@@ -27,6 +31,7 @@ chat_actions.py — библиотека для работы с Telegram Web ч�
 
 import asyncio
 import base64
+import re
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -67,6 +72,32 @@ _JS_GET_MESSAGES = """
         }
 
         result.push({ index, isOut, text });
+    }
+    return result;
+}
+"""
+
+# JS для получения чатов с непрочитанными сообщениями из списка чатов
+_JS_GET_UNREAD_CHATS = """
+() => {
+    const result = [];
+    // Ищем все item-элементы в списке чатов
+    const items = document.querySelectorAll(
+        '.scrollListContent .item, .chatList .item, [class*="scrollListContent"] .item'
+    );
+    for (const item of items) {
+        // Badge с непрочитанными — div.badgeIcon с числом внутри
+        const badge = item.querySelector('[class*="badgeIcon"] .text, .badge .text, [class*="badge"] span.text');
+        if (!badge) continue;
+        const count = parseInt(badge.innerText.trim(), 10);
+        if (!count || count < 1) continue;
+
+        // Имя чата
+        const nameEl = item.querySelector('h3 span.text, .title span.text, h3 .name span.text');
+        const name = nameEl ? nameEl.innerText.trim() : null;
+        if (!name) continue;
+
+        result.push({ name, unread: count });
     }
     return result;
 }
@@ -178,16 +209,27 @@ class ChatSession:
         self,
         callback: MessageCallback,
         poll_interval: float = 1.5,
+        process_existing: bool = False,
+        last_seen_index: int | None = None,
+        on_index_seen: "Callable[[int], None] | None" = None,
     ) -> asyncio.Task:
         """
         Запускает фоновую задачу опроса новых сообщений.
         Callback вызывается для каждого нового сообщения: await callback(text, is_out).
         При повторном вызове предыдущая задача останавливается.
         Возвращает asyncio.Task — можно отменить через task.cancel().
+
+        process_existing=True   — прогнать через callback все уже видимые
+                                  входящие сообщения при старте с idx > last_seen_index.
+        last_seen_index         — последний index обработанный в прошлой сессии
+                                  (загружается из BotState). Всё с idx <= этого значения
+                                  пропускается — бот уже отвечал на эти сообщения.
+        on_index_seen(idx)      — вызывается синхронно после каждого обработанного
+                                  сообщения, чтобы сохранить прогресс в BotState.
         """
         self.stop_listening()
         self._listen_task = asyncio.create_task(
-            self._listen_loop(callback, poll_interval),
+            self._listen_loop(callback, poll_interval, process_existing, last_seen_index, on_index_seen),
             name=f"listen:{self._chat_name}",
         )
         return self._listen_task
@@ -202,12 +244,41 @@ class ChatSession:
         self,
         callback: MessageCallback,
         poll_interval: float,
+        process_existing: bool = False,
+        last_seen_index: int | None = None,
+        on_index_seen=None,
     ) -> None:
         # Запоминаем set индексов которые уже есть в DOM на момент старта.
         # Всё что появится позже — новое. Работает надёжно независимо от того,
         # с какого числа начинаются виртуальные data-index и как они растут.
         initial = await self._page.evaluate(_JS_GET_MESSAGES)
         seen_indices: set[int] = {m["index"] for m in initial}
+
+        # Если process_existing=True — прогоняем уже видимые входящие через
+        # callback, но только те у которых idx > last_seen_index.
+        # last_seen_index=None означает первый запуск бота — обрабатываем всё.
+        if process_existing:
+            print(f"[{self._chat_name}] Обрабатываю уже существующие непрочитанные "
+                  f"(last_seen_index={last_seen_index})...")
+            for msg in initial:
+                text   = msg["text"]
+                is_out = msg["isOut"]
+                idx    = msg["index"]
+                if not text or is_out:
+                    continue
+                # Пропускаем всё что бот уже обработал в прошлой сессии.
+                # Строго < : само сообщение с last_seen_index тоже надо обработать
+                # (оно было последним входящим — бот мог не успеть ответить).
+                if last_seen_index is not None and idx < last_seen_index:
+                    continue
+                print(f"[{self._chat_name}] Входящее (existing) [idx={idx}]: {text!r}")
+                try:
+                    await callback(text, is_out)
+                except Exception as e:
+                    print(f"[{self._chat_name}] Ошибка в callback (existing): {e}")
+                if on_index_seen:
+                    on_index_seen(idx)
+
         print(f"[{self._chat_name}] Слушаем новые сообщения...")
 
         while True:
@@ -235,6 +306,8 @@ class ChatSession:
                         await callback(text, is_out)
                     except Exception as e:
                         print(f"[{self._chat_name}] Ошибка в callback: {e}")
+                    if on_index_seen:
+                        on_index_seen(idx)
 
             except asyncio.CancelledError:
                 print(f"[{self._chat_name}] Подписка остановлена.")
@@ -274,6 +347,37 @@ async def open_chat(page: Page, chat_name: str, timeout: int = 10_000) -> "ChatS
     except Exception as e:
         print(f"[open_chat] Не удалось открыть чат '{chat_name}': {e}")
         return None
+
+
+async def get_current_chat_id(page: Page) -> str | None:
+    """
+    Извлекает числовой id текущего открытого чата из URL.
+    Пример: https://web.max.ru/56366434 → '56366434'
+    Возвращает None если URL не содержит id.
+    """
+    url = page.url
+    m = re.search(r"/(\d+)(?:[?#].*)?$", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def get_chats_with_unread(page: Page) -> list[dict]:
+    """
+    Сканирует список чатов и возвращает те, у которых есть непрочитанные сообщения.
+
+    Возвращает список словарей:
+        [{"name": str, "unread": int}, ...]
+
+    Требует чтобы список чатов был виден (не скрыт открытым чатом).
+    На узких viewport это может быть не так — тогда список будет пуст.
+    """
+    try:
+        result = await page.evaluate(_JS_GET_UNREAD_CHATS)
+        return result or []
+    except Exception as e:
+        print(f"[get_chats_with_unread] Ошибка: {e}")
+        return []
 
 
 async def send_to_chat(
