@@ -27,12 +27,14 @@ CHAT_NAME = "Окно в Европу"
 # ─────────────────────────────────────────────────────────────────────────────
 
 WHITELISTS = [
-    {"name": "vless_lite.txt",
+    {"name": "zieng2.txt",
      "url": "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt"},
-    {"name": "whitelist_nowmeow.txt",
+    {"name": "nowmeow.txt",
      "url": "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist"},
-    {"name": "Vless-Reality-White-Lists-Rus-Mobile.txt",
+    {"name": "igareck.txt",
      "url": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt"},
+    {"name": "goida-vpn.txt",
+     "url": "http://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/26.txt"},
 ]
 
 MEME_SUBREDDITS_EN = ["memes", "dankmemes", "wholesomememes", "AdviceAnimals"]
